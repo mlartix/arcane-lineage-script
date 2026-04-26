@@ -876,13 +876,13 @@ end
 -- Priority list, top-to-bottom. First usable skill wins.
 -- Anything not listed here falls back to alphabetic order at the end.
 
-local SkillPriority = {
+local SkillPriority = _G.SkillPriority or {
     -- Buffs / heals first
-    "Lesser Empower",
+   -- "Lesser Empower",
 
     -- Heavy damage skills next
-    "Pommel Strike",
-    "Double Slash",
+    --"Pommel Strike",
+   -- "Double Slash",
     -- Default attack last
     "Strike",
 }
