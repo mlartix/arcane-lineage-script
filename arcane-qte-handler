@@ -1,0 +1,1092 @@
+--[[
+    Arcane Lineage QTE auto-handler - Severe port
+    Converted from Matcha. Key changes:
+      - memory_read("type", addr)              -> memory.read<type>(userdata, offset)
+      - Instance.Address                       -> pass the userdata + offset directly to memory.*
+      - HttpService:JSONDecode                 -> crypt.json.decode
+      - notify(msg, title, dur)                -> send_notification(content)
+      - ismouse1pressed                        -> isleftpressed
+      - Player:GetMouse                        -> use UserInputService:GetMouseLocation
+      - RunService.Heartbeat (not in Severe)   -> task.spawn loop with task.wait()
+      - Signal :Connect/:Disconnect            -> :connect/:disconnect (lowercase)
+      - mouse1press/release/move helpers exist on Severe with the same names
+      - keypress/keyrelease exist on Severe with the same names
+
+    Memory offsets (ScreenGuiEnabled, FrameVisible, FramePositionX, FrameRotation,
+    Name pointer, Image, BackgroundColor3) come from the same offsets feeds the
+    original used; on Severe we just pass them as the `offset` argument to the
+    typed memory readers instead of building absolute addresses by hand.
+--]]
+
+----------------------------------------------------- Offsets
+local AutoSkillEnabled = true  -- toggle to false to disable auto-skill
+local InCombat = false
+local Offsets = crypt.json.decode(game:HttpGet("https://offsets.ntgetwritewatch.workers.dev/offsets.json"))
+-- Pinned to the version dump that matches your Roblox build. The generic
+-- /Offsets/Offsets.json URL is a fallback in case the pinned URL goes stale.
+local TheoOffsets do
+    local function fetch(url)
+        local ok, body = pcall(game.HttpGet, game, url)
+        if not ok or not body then return nil end
+        local okDecode, decoded = pcall(crypt.json.decode, body)
+        if not okDecode or type(decoded) ~= "table" or not decoded.Offsets then return nil end
+        return decoded.Offsets, decoded["Roblox Version"]
+    end
+
+    local urls = {
+        "https://imtheo.lol/Offsets/version-9d412f44a6fe4081/Offsets.json",
+        "https://imtheo.lol/Offsets/Offsets.json",
+    }
+
+    for _, url in ipairs(urls) do
+        local offsets, version = fetch(url)
+        if offsets then
+            TheoOffsets = offsets
+            print(string.format("[Offsets] Loaded %s (Roblox %s)", url, tostring(version)))
+            break
+        else
+            warn("[Offsets] Failed to load " .. url)
+        end
+    end
+
+    if not TheoOffsets then
+        error("Could not load Theo offsets from any URL")
+    end
+end
+
+----------------------------------------------------- Services & UI roots
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer.PlayerGui
+local CombatScreenGui = PlayerGui.Combat
+
+local QTE_UI = {
+    ["BlockingQTE"] = {
+        ["QTE_Container"] = CombatScreenGui.Block,
+        ["Indicator"] = CombatScreenGui.Block.Inset.Indicator,
+        ["Target"] = CombatScreenGui.Block.Inset.Dodge,
+        ["LastVisibleTime"] = nil,
+        ["Debounce"] = 0,
+        ["IsRunning"] = false,
+    },
+    ["MagicQTE"] = {
+        ["QTE_Container"] = CombatScreenGui.MagicQTE,
+        ["RuneSlots"] = CombatScreenGui.MagicQTE.RuneSlots,
+        ["RunePieces"] = CombatScreenGui.MagicQTE.Bag,
+        ["LastVisibleTime"] = nil,
+        ["Debounce"] = 0,
+        ["IsRunning"] = false,
+    },
+    ["FistQTE"] = {
+        ["QTE_Container"] = CombatScreenGui.FistQTE,
+        ["KeyHolder"] = CombatScreenGui.FistQTE.KeyHolder,
+        ["LastVisibleTime"] = nil,
+        ["Debounce"] = 0,
+        ["IsRunning"] = false,
+    },
+    ["DaggerQTE"] = {
+        ["QTE_Container"] = CombatScreenGui.DaggerQTE,
+        ["LastVisibleTime"] = nil,
+        ["Debounce"] = 0,
+        ["IsRunning"] = false,
+    },
+    ["SwordQTE"] = {
+        ["QTE_Container"] = CombatScreenGui.SwordQTE,
+        ["Inset"] = CombatScreenGui.SwordQTE.Inset,
+        ["Window"] = CombatScreenGui.SwordQTE.Inset.Window,
+        ["LastVisibleTime"] = nil,
+        ["Debounce"] = 0,
+        ["IsRunning"] = false,
+    },
+    ["SpearQTE"] = {
+        ["QTE_Container"] = CombatScreenGui.SpearQTE,
+        ["LastVisibleTime"] = nil,
+        ["Debounce"] = 0,
+        ["IsRunning"] = false,
+    },
+}
+
+----------------------------------------------------- Input
+
+local function PressKey(Keycode)
+    keypress(Keycode)
+    task.wait(math.random(20, 40) * 0.001)
+    keyrelease(Keycode)
+end
+
+----------------------------------------------------- Memory reading
+-- Severe lets us pass (userdata, offset) directly, so we don't need
+-- Instance.Address. The offsets are the same as Matcha's.
+
+local function IsScreenGuiEnabled(ScreenGui)
+    if not ScreenGui then return end
+    local Status = memory.readu8(ScreenGui, Offsets.ScreenGuiEnabled)
+    return Status ~= 0
+end
+
+local function IsFrameVisible(Frame)
+    if not Frame then return false end
+    local ok, val = pcall(memory.readu8, Frame, Offsets.FrameVisible)
+    if not ok then return false end
+    return val ~= 0
+end
+
+local function GetTextColor(TextLabel)
+    if not TextLabel then return nil end
+    local TextColorOffset = 0xE70
+
+    local ok, r, g, b = pcall(function()
+        return memory.readf32(TextLabel, TextColorOffset),
+               memory.readf32(TextLabel, TextColorOffset + 4),
+               memory.readf32(TextLabel, TextColorOffset + 8)
+    end)
+
+    if ok and r and g and b then
+        return Color3.new(r, g, b)
+    end
+    return nil
+end
+
+local function GetName(InstanceObj)
+    -- Read the Name pointer at Offsets.Name, then read the null-terminated
+    -- string at that pointer. memory.readstring takes either an absolute
+    -- address or (userdata, offset).
+    if not InstanceObj then return end
+    local namePointer = memory.readu64(InstanceObj, Offsets.Name)
+    if namePointer == 0 then return nil end
+    return memory.readstring(namePointer)
+end
+
+local function BruteForceImageId(ImageObject)
+    if not ImageObject then return nil end
+    print("--- Brute Forcing Offsets for: " .. ImageObject.Name .. " ---")
+
+    for offset = 0, 4096, 4 do
+        local success, ptr = pcall(memory.readu64, ImageObject, offset)
+        if success and ptr and ptr > 0x1000 then
+            local strSuccess, value = pcall(memory.readstring, ptr)
+            if strSuccess and value and #value > 5 then
+                if string.find(value, "rbxassetid://") or string.find(value, "asset") then
+                    print(string.format("[!] FOUND ID at Offset 0x%X: %s", offset, value))
+                    return value, offset
+                end
+            end
+        end
+    end
+
+    print("--- Scan Complete: No ID found ---")
+    return nil
+end
+
+local function GetImageId(ImageObject)
+    if not ImageObject then return nil end
+    local ImageButtonOffset = 0xCC8 -- needs to be manually tracked
+
+    local function read(off)
+        local ptr = memory.readu64(ImageObject, off)
+        if ptr == 0 then return nil end
+        local ok, str = pcall(memory.readstring, ptr)
+        return ok and str or nil
+    end
+
+    return read(ImageButtonOffset) or read(TheoOffsets.GuiObject.Image)
+end
+
+local function GetBackgroundColor(ImageObject)
+    if not ImageObject then return nil end
+    local BGcolorOffset = TheoOffsets.GuiObject.BackgroundColor3
+
+    local ok, r, g, b = pcall(function()
+        return memory.readf32(ImageObject, BGcolorOffset),
+               memory.readf32(ImageObject, BGcolorOffset + 4),
+               memory.readf32(ImageObject, BGcolorOffset + 8)
+    end)
+
+    if ok and r and g and b then
+        return Color3.new(r, g, b)
+    end
+    return nil
+end
+
+local function GetImageColor(ImageObject)
+    if not ImageObject then return nil end
+    local Offset = (ImageObject.ClassName == "ImageButton") and 0xD38 or 0xB58
+
+    local ok, r, g, b = pcall(function()
+        return memory.readf32(ImageObject, Offset),
+               memory.readf32(ImageObject, Offset + 4),
+               memory.readf32(ImageObject, Offset + 8)
+    end)
+
+    if ok and r and g and b then
+        return Color3.new(r, g, b)
+    end
+    return nil
+end
+
+local function BruteForceTransparency(ImageObject, TargetValue)
+    if not ImageObject then return nil end
+    local Epsilon = 0.001
+    TargetValue = tonumber(TargetValue) or 0
+
+    print(string.format("--- Brute Forcing Transparency (%.2f) for: %s ---", TargetValue, ImageObject.Name))
+
+    for offset = 0, 4096, 4 do
+        local success, value = pcall(memory.readf32, ImageObject, offset)
+        if success and value and math.abs(value - TargetValue) < Epsilon then
+            if value >= 0 and value <= 1 then
+                print(string.format("[!] POTENTIAL Transparency at Offset 0x%X: %.4f", offset, value))
+                return value, offset
+            end
+        end
+    end
+
+    print("--- Scan Complete: No matching transparency found ---")
+    return nil
+end
+
+local function GetImageTransparency(GuiObject)
+    if not GuiObject then return nil end
+    local TransparencyOffset = 0xA7C
+    return memory.readf32(GuiObject, TransparencyOffset)
+end
+
+local function GetFrameRotation(ImageObject)
+    if not ImageObject then return nil end
+    return memory.readf32(ImageObject, Offsets.FrameRotation)
+end
+
+local LastValues = {}
+
+local function ScanForChangedRotation(ImageObject)
+    if not ImageObject then return end
+
+    for offset = 0, 4096, 4 do
+        local success, value = pcall(memory.readf32, ImageObject, offset)
+        if success and value then
+            if LastValues[offset] and math.abs(value - LastValues[offset]) > 0.01 then
+                if value >= -360 and value <= 360 then
+                    print(string.format("[!] VALUE CHANGED | Offset: 0x%X | Old: %.2f | New: %.2f",
+                        offset, LastValues[offset], value))
+                end
+            end
+            LastValues[offset] = value
+        end
+    end
+end
+
+local function SAFEWriteFrameRotation(ImageObject, NewRotation)
+    if not ImageObject then return false end
+    local LogicOffset = 0x5A0
+    memory.writef32(ImageObject, LogicOffset, NewRotation)
+    return true
+end
+
+-- Severe doesn't expose RunService.Heartbeat, so use a spawned task.wait loop.
+local function LockRotationForDuration(Ring, TargetRotation, Duration)
+    task.spawn(function()
+        local StartTick = os.clock()
+        while (os.clock() - StartTick) < Duration do
+            SAFEWriteFrameRotation(Ring, TargetRotation)
+            task.wait()
+        end
+    end)
+end
+
+----------------------------------------------------- Helpers
+
+-- AbsolutePosition / AbsoluteSize are not exposed as direct properties on
+-- Severe's GUI objects. Read them from memory using the offsets feed.
+-- We resolve the offsets once at startup; if a key is missing from the feed
+-- we fall back to commonly-seen offsets and log what we found.
+local function resolveOffset(possiblePaths, fallback)
+    for _, path in ipairs(possiblePaths) do
+        local cur = TheoOffsets
+        for part in path:gmatch("[^%.]+") do
+            if type(cur) ~= "table" then cur = nil break end
+            cur = cur[part]
+        end
+        if type(cur) == "number" then
+            return cur, path
+        end
+    end
+    return fallback, "fallback"
+end
+
+-- These keys live under `GuiBase2D` in the Theo offsets dump, not `GuiObject`.
+-- Note the capital D — `GuiBase2d` (lowercase d) won't match.
+local AbsolutePositionOffset, _apSrc = resolveOffset({
+    "GuiBase2D.AbsolutePosition",
+    "GuiObject.AbsolutePosition",
+}, 272) -- 0x110, value from imtheo.lol dump (older build, but close)
+local AbsoluteSizeOffset, _asSrc = resolveOffset({
+    "GuiBase2D.AbsoluteSize",
+    "GuiObject.AbsoluteSize",
+}, 280) -- 0x118, value from imtheo.lol dump
+
+print(string.format("[Offsets] AbsolutePosition = 0x%X (%s)", AbsolutePositionOffset, _apSrc))
+print(string.format("[Offsets] AbsoluteSize     = 0x%X (%s)", AbsoluteSizeOffset, _asSrc))
+
+-- Helpful one-time dump so you can see what keys are actually in the feed
+-- if the resolver had to fall back.
+if _apSrc == "fallback" or _asSrc == "fallback" then
+    print("[Offsets] Available keys in TheoOffsets:")
+    for _, section in ipairs({ "GuiBase2D", "GuiObject" }) do
+        local tbl = TheoOffsets[section]
+        print(string.format("  %s = %s", section, type(tbl)))
+        if type(tbl) == "table" then
+            for k, v in pairs(tbl) do
+                print(string.format("    %s = %s", tostring(k), tostring(v)))
+            end
+        end
+    end
+end
+
+-- Drift canary: ScreenGui's AbsoluteSize should match Camera.ViewportSize.
+-- If they don't, our offsets are wrong for this Roblox build — warn loudly
+-- so you know to grab fresh offsets instead of silently misbehaving.
+do
+    local ok, msg = pcall(function()
+        local vp = workspace.CurrentCamera.ViewportSize
+        local sx = memory.readf32(CombatScreenGui, AbsoluteSizeOffset)
+        local sy = memory.readf32(CombatScreenGui, AbsoluteSizeOffset + 4)
+        local dx = math.abs(sx - vp.X)
+        local dy = math.abs(sy - vp.Y)
+        if dx > 8 or dy > 8 then
+            error(string.format(
+                "ScreenGui AbsoluteSize (%.0f, %.0f) doesn't match viewport (%.0f, %.0f)",
+                sx, sy, vp.X, vp.Y))
+        end
+        print(string.format("[Sanity] OK — ScreenGui.AbsoluteSize (%.0f, %.0f) ≈ ViewportSize",
+            sx, sy))
+    end)
+    if not ok then
+        warn("[Sanity] OFFSETS MAY BE WRONG: " .. tostring(msg))
+        warn("[Sanity] Grab fresh offsets from https://imtheo.lol/Offsets/")
+        warn("[Sanity] (find your Roblox version folder at %LocalAppData%\\Roblox\\Versions)")
+    end
+end
+
+local function GetAbsolutePosition(GuiObject)
+    if not GuiObject then return Vector2.new(0, 0) end
+    local x = memory.readf32(GuiObject, AbsolutePositionOffset)
+    local y = memory.readf32(GuiObject, AbsolutePositionOffset + 4)
+    return Vector2.new(x, y)
+end
+
+local function GetAbsoluteSize(GuiObject)
+    if not GuiObject then return Vector2.new(0, 0) end
+    local x = memory.readf32(GuiObject, AbsoluteSizeOffset)
+    local y = memory.readf32(GuiObject, AbsoluteSizeOffset + 4)
+    return Vector2.new(x, y)
+end
+
+local function ColorsMatch(Color3_A, Color3_B)
+    local Tolerance = 0.1
+    if not Color3_A or not Color3_B then return false end
+
+    local rDiff = math.abs(Color3_A.R - Color3_B.R)
+    local gDiff = math.abs(Color3_A.G - Color3_B.G)
+    local bDiff = math.abs(Color3_A.B - Color3_B.B)
+
+    return (rDiff <= Tolerance and gDiff <= Tolerance and bDiff <= Tolerance)
+end
+
+local function AreUIObjectsAligned(ObjectA, ObjectB)
+    local posA, sizeA = GetAbsolutePosition(ObjectA), GetAbsoluteSize(ObjectA)
+    local posB, sizeB = GetAbsolutePosition(ObjectB), GetAbsoluteSize(ObjectB)
+
+    local centerAX = posA.X + (sizeA.X / 2)
+    local centerAY = posA.Y + (sizeA.Y / 2)
+    local centerBX = posB.X + (sizeB.X / 2)
+    local centerBY = posB.Y + (sizeB.Y / 2)
+
+    local diffX = centerAX - centerBX
+    local diffY = centerAY - centerBY
+    local Distance = math.sqrt(diffX^2 + diffY^2)
+
+    local isAligned = (math.abs(diffX) < (sizeA.X + sizeB.X) / 2)
+                  and (math.abs(diffY) < (sizeA.Y + sizeB.Y) / 2)
+
+    return isAligned, Distance
+end
+
+local Dragging = false
+
+-- Severe Drawing.new("Text") props differ slightly from Matcha:
+--   - Font is a NUMBER index (0..31), not a string
+--   - Has Opacity in [0,1]
+local function _DragDebug()
+    local DragText = Drawing.new("Text")
+    DragText.Visible = true
+    DragText.Center = true
+    DragText.Outline = true
+    DragText.Size = 20
+    DragText.Color = Color3.fromRGB(255, 255, 255)
+    DragText.Opacity = 1
+
+    while Dragging do
+        local MousePosition = UserInputService:GetMouseLocation()
+        local IsPressed = isleftpressed()
+        DragText.Text = string.format("Dragging Active | M1: %s",
+            IsPressed and "PRESSED" or "RELEASED")
+        DragText.Color = IsPressed
+            and Color3.fromRGB(0, 255, 0)
+            or  Color3.fromRGB(255, 255, 255)
+        DragText.Position = MousePosition + Vector2.new(0, 30)
+        task.wait(0.01)
+    end
+
+    DragText:Remove()
+end
+
+local MAX_X, MAX_Y = 1920, 1080
+
+local function IsValid(Pos)
+    return Pos
+        and (Pos.X == Pos.X) -- NaN check
+        and Pos.X > 0 and Pos.X < MAX_X
+        and Pos.Y > 0 and Pos.Y < MAX_Y
+end
+
+local function ApplyVariance(Pos, Amount)
+    if not Amount or Amount <= 0 then return Pos end
+    local offsetX = math.random(-Amount, Amount)
+    local offsetY = math.random(-Amount, Amount)
+    return Vector2.new(Pos.X + offsetX, Pos.Y + offsetY)
+end
+
+local function ClickAndDragTo(StartPosition, NewPosition, Duration, Variance)
+    local ActualStart = ApplyVariance(StartPosition, Variance)
+    local ActualEnd = ApplyVariance(NewPosition, Variance)
+
+    if not IsValid(ActualStart) or not IsValid(ActualEnd) then return end
+
+    Dragging = true
+    task.spawn(_DragDebug)
+
+    mousemoveabs(ActualStart.X, ActualStart.Y)
+    task.wait(0.01)
+    mousemoverel(math.random(1, 5), math.random(1, 5))
+
+    mouse1press()
+    task.wait(0.05)
+
+    if not Duration or Duration <= 0 then
+        mousemoveabs(ActualEnd.X, ActualEnd.Y)
+    else
+        local TotalDelta = ActualEnd - ActualStart
+        local StartTime = os.clock()
+        while os.clock() - StartTime < Duration do
+            local Elapsed = os.clock() - StartTime
+            local Progress = math.clamp(Elapsed / Duration, 0, 1)
+            local TargetPos = ActualStart + (TotalDelta * Progress)
+            mousemoveabs(TargetPos.X, TargetPos.Y)
+            task.wait()
+        end
+    end
+
+    task.wait(0.05)
+    mouse1release()
+    Dragging = false
+end
+
+local function GetCenter(GuiObject)
+    local Pos = GetAbsolutePosition(GuiObject)
+    local Size = GetAbsoluteSize(GuiObject)
+    return Vector2.new(Pos.X + (Size.X / 2), Pos.Y + (Size.Y / 2))
+end
+
+----------------------------------------------------- Block QTE
+
+----------------------------------------------------- Block QTE
+
+local BlockExpanded = false
+
+local function DoBlockBar(Indicator, Target)
+    -- Expand the Block zone to cover the entire Inset width.
+    -- GuiCollisionService.isColliding (used by the game's validation) reads
+    -- AbsolutePosition + AbsoluteSize, so making the zone span the whole bar
+    -- means any space press during the QTE collides with the zone.
+    if not BlockExpanded then
+        memory.writef32(Target, AbsolutePositionOffset, 0)      -- AbsolutePosition.X = 0
+        memory.writef32(Target, AbsoluteSizeOffset, 10000)      -- AbsoluteSize.X = 10000
+        BlockExpanded = true
+    end
+
+    -- The original "new run detection" still works since the indicator's tween
+    -- is unchanged.
+    local IndicatorPositionX = memory.readf32(Indicator, Offsets.FramePositionX)
+    if IndicatorPositionX < 0.1 then
+        return
+    end
+
+    local Cooldown = os.clock() < QTE_UI.BlockingQTE.Debounce
+
+    if not Cooldown then
+        QTE_UI.BlockingQTE.Debounce = os.clock() + 1
+        print("[Block] auto-pressed")
+        PressKey(32)
+        QTE_UI.BlockingQTE.LastVisibleTime = nil
+    end
+end
+
+----------------------------------------------------- Magic QTE
+
+local function GetRunePairs(Slots, Pieces)
+    local SlotLookup = {}
+    local FinalPairs = {}
+    local NumberToProcess = 0
+
+    if #Pieces == 0 then return NumberToProcess, {} end
+
+    for _, slot in Slots do
+        local sName = GetName(slot)
+        if sName and sName ~= "UIGridLayout" then
+            SlotLookup[sName] = slot
+        end
+    end
+
+    for _, piece in Pieces do
+        local pName = GetName(piece)
+        if pName ~= "Slotted" then
+            NumberToProcess += 1
+            local matchedSlot = SlotLookup[pName]
+            if matchedSlot then
+                FinalPairs[piece] = matchedSlot
+            end
+        end
+    end
+
+    return NumberToProcess, FinalPairs
+end
+
+local MagicThread = false
+
+local function DoMagicQTE(SlotsFolder, PiecesFolder)
+    local NumberToProcess, RunePairs = GetRunePairs(
+        SlotsFolder:GetChildren(),
+        PiecesFolder:GetChildren()
+    )
+
+    for piece, slot in pairs(RunePairs) do
+        if not MagicThread then
+            MagicThread = true
+            local CenterPiecePosition = GetCenter(piece)
+            local CenterSlotPosition = GetCenter(slot)
+            ClickAndDragTo(CenterPiecePosition, CenterSlotPosition, 0.03, 5)
+            MagicThread = false
+            break
+        end
+    end
+end
+
+----------------------------------------------------- Fist QTE
+
+local InputTableForWASD = {
+    { ["Rot"] = "rbxassetid://118628353797999", ["PressKeycode"] = 87 }, -- up    W
+    { ["Rot"] = "rbxassetid://140027853530361", ["PressKeycode"] = 68 }, -- right D
+    { ["Rot"] = "rbxassetid://126374325851918", ["PressKeycode"] = 83 }, -- down  S
+    { ["Rot"] = "rbxassetid://93065360272027",  ["PressKeycode"] = 65 }, -- left  A
+}
+
+local IDLE_COLOR = Color3.new(1, 1, 1)
+-- Keyed by the userdata itself rather than the address number.
+local PressedIndices = {}
+
+local function DoFistQTE(KeyHolder)
+    local KeysToProcess = {}
+
+    for _, Key in KeyHolder:GetChildren() do
+        if Key.Name ~= "UIListLayout" then
+            table.insert(KeysToProcess, Key)
+        end
+    end
+
+    table.sort(KeysToProcess, function(a, b)
+        return tonumber(a.Name) < tonumber(b.Name)
+    end)
+
+    for i, v in KeysToProcess do
+        if PressedIndices[v] then continue end
+
+        local ImgColor = GetImageColor(v)
+
+        if ImgColor then
+            print(string.format("Checking %s | BG: %.4f, %.4f, %.4f",
+                v.Name, ImgColor.R, ImgColor.G, ImgColor.B))
+        end
+
+        if not ColorsMatch(ImgColor, IDLE_COLOR) then
+            local currentId = GetImageId(v)
+            for _, data in InputTableForWASD do
+                if data.Rot == currentId then
+                    PressedIndices[v] = true
+                    PressKey(data.PressKeycode)
+                    return
+                end
+            end
+        end
+    end
+end
+
+----------------------------------------------------- Dagger QTE
+
+local LockedRings = {}
+
+local function DoDaggerQTE(RingsFolder)
+    task.wait(0.1)
+    while true do
+        local children = RingsFolder:GetChildren()
+        local RingsExist = false
+
+        for _, Ring in ipairs(children) do
+            local idx = tonumber(Ring.Name)
+            if idx then
+                RingsExist = true
+                if not LockedRings[Ring] then
+                    LockedRings[Ring] = true
+                    LockRotationForDuration(Ring, 0, 3)
+                    print("Locked ", idx)
+                end
+                SAFEWriteFrameRotation(Ring, 0)
+            end
+        end
+
+        if not RingsExist then
+            print("No visible rings remaining. Exiting.")
+            LockedRings = {}
+            break
+        end
+
+        keypress(32)
+        keyrelease(32)
+        task.wait(0.05)
+    end
+end
+
+----------------------------------------------------- Sword QTE
+
+local SwordExpanded = false
+local PressedSwordZones = {}
+local SwordLockThread = nil
+
+local function DoSwordQTE(Inset, Window)
+    if not SwordLockThread then
+        SwordLockThread = task.spawn(function()
+            -- Expand Window to cover the whole Inset width on QTE start
+            if not SwordExpanded then
+                memory.writef32(Window, AbsolutePositionOffset, 0)
+                memory.writef32(Window, AbsoluteSizeOffset, 10000)
+                SwordExpanded = true
+            end
+
+            while IsFrameVisible(QTE_UI.SwordQTE.QTE_Container) do
+                -- Find the lowest-numbered unpressed zone
+                local lowestUnpressed = nil
+                local lowestN = math.huge
+                for _, child in Inset:GetChildren() do
+                    local n = tonumber(child.Name)
+                    if n and not PressedSwordZones[child] then
+                        if n < lowestN then
+                            lowestN = n
+                            lowestUnpressed = child
+                        end
+                    end
+                end
+
+                -- Press space for each zone as it becomes the active one
+                if lowestUnpressed and os.clock() >= QTE_UI.SwordQTE.Debounce then
+                    PressedSwordZones[lowestUnpressed] = true
+                    QTE_UI.SwordQTE.Debounce = os.clock() + 0.05
+                    PressKey(32)
+                    print(string.format("[Sword] PRESSED zone %d", lowestN))
+                end
+
+                task.wait()
+            end
+            SwordLockThread = nil
+        end)
+    end
+end
+
+----------------------------------------------------- Spear QTE
+
+local function DoSpearQTE(RingsFolder)
+    local Ring = RingsFolder:FindFirstChild("Ring")
+    if not Ring then return end
+
+    local Indicator = Ring:FindFirstChild("Indicator")
+    if not Indicator then return end
+
+    local Transparency = GetImageTransparency(Indicator)
+    local IndicatorSize = GetAbsoluteSize(Indicator)
+
+    -- Bail if the ring hasn't laid out yet (size hasn't been computed)
+    if IndicatorSize.X <= 1 then return end
+
+    local IsReady = (Transparency and Transparency > 0.75)
+                and (IndicatorSize.X < 135)
+
+    if not IsReady then return end
+
+    local RingPos = GetCenter(Ring)
+    mousemoveabs(RingPos.X, RingPos.Y)
+    mousemoverel(1, 1)
+    mouse1press()
+    mouse1release()
+end
+----------------------------------------------------- Combat thread
+
+local QTE_Locks = {}
+
+local function CombatLoop()
+    while true do
+        local ok, err = pcall(function()
+            for QTE_Type, Data in pairs(QTE_UI) do
+                if not Data.QTE_Container then continue end
+
+                local QTE_Visible = IsFrameVisible(Data.QTE_Container)
+
+                if QTE_Visible then
+                    Data.IsActive = true
+
+                    if not QTE_Locks[QTE_Type] then
+                        task.spawn(function()
+                            QTE_Locks[QTE_Type] = true
+
+                            local handlerOk, handlerErr = pcall(function()
+                                if QTE_Type == "FistQTE" then
+                                    task.wait(0.2)
+                                    DoFistQTE(Data.KeyHolder)
+                                elseif QTE_Type == "BlockingQTE" then
+                                    DoBlockBar(Data.Indicator, Data.Target)
+                                elseif QTE_Type == "MagicQTE" then
+                                    DoMagicQTE(Data.RuneSlots, Data.RunePieces)
+                                elseif QTE_Type == "DaggerQTE" then
+                                    DoDaggerQTE(Data.QTE_Container)
+                                elseif QTE_Type == "SwordQTE" then
+                                    DoSwordQTE(Data.Inset, Data.Window)
+                                elseif QTE_Type == "SpearQTE" then
+                                    DoSpearQTE(Data.QTE_Container)
+                                    task.wait(0.1)
+                                end
+                            end)
+                            if not handlerOk then
+                                warn("[QTE] " .. QTE_Type .. " handler error: " .. tostring(handlerErr))
+                            end
+
+                            QTE_Locks[QTE_Type] = false
+                        end)
+                    end
+                else
+                    if Data.IsActive then
+                        QTE_Locks[QTE_Type] = false
+                        Data.LastVisibleTime = nil
+                        Data.IsActive = false
+                        PressedIndices = {}
+                        PressedSwordZones = {}
+                        BlockExpanded = false
+                        SwordExpanded = false
+                    end
+                end
+            end
+        end)
+
+        if not ok then
+            warn("[CombatLoop] iteration error: " .. tostring(err))
+        end
+
+        task.wait()
+    end
+end
+
+
+----------------------------------------------------- AutoSkill helpers
+
+-- Wait until a GUI's AbsolutePosition has been stable for ~50ms.
+local function waitForStable(gui, timeout)
+    timeout = timeout or 1.0
+    local start = os.clock()
+    local lastX, lastY = -1, -1
+    local stableSince = nil
+    while os.clock() - start < timeout do
+        local x = memory.readf32(gui, AbsolutePositionOffset)
+        local y = memory.readf32(gui, AbsolutePositionOffset + 4)
+        if math.abs(x - lastX) < 0.5 and math.abs(y - lastY) < 0.5 then
+            if not stableSince then stableSince = os.clock() end
+            if os.clock() - stableSince >= 0.05 then return true end
+        else
+            stableSince = nil
+        end
+        lastX, lastY = x, y
+        task.wait()
+    end
+    return false
+end
+
+local function ClickGui(gui, label)
+    waitForStable(gui, 1.0)
+    local c = GetCenter(gui)
+    if c.X <= 0 or c.Y <= 0 then return false end
+
+    -- Teleport to slightly below center (more reliable hover region)
+    local clickX = c.X
+    local clickY = c.Y + 5
+
+    print(string.format("[AutoSkill] Clicking %s at (%.0f, %.0f)", label, clickX, clickY))
+
+    -- Jitter sequence: teleport to a few nearby points around the target.
+    -- This forces MouseMoved events to fire so the GUI registers a hover.
+    -- A single mousemoveabs sometimes doesn't trigger MouseEnter on the
+    -- destination element.
+    mousemoveabs(clickX - 3, clickY - 3)
+    task.wait(0.02)
+    mousemoveabs(clickX + 3, clickY + 3)
+    task.wait(0.02)
+    mousemoveabs(clickX, clickY)
+    task.wait(0.05)
+
+    -- Tiny relative nudge to be extra sure MouseMoved fires at the click site
+    mousemoverel(1, 0)
+    task.wait(0.01)
+    mousemoverel(-1, 0)
+    task.wait(0.02)
+
+    mouse1press()
+    task.wait(0.08)
+    mouse1release()
+    return true
+end
+
+local function WaitFor(cond, timeout, label)
+    local start = os.clock()
+    while os.clock() - start < timeout do
+        if cond() then return true end
+        task.wait()
+    end
+    print(string.format("[AutoSkill] Timeout: %s", label or "?"))
+    return false
+end
+
+----------------------------------------------------- Skill priority
+-- Priority list, top-to-bottom. First usable skill wins.
+-- Anything not listed here falls back to alphabetic order at the end.
+
+local SkillPriority = {
+    -- Buffs / heals first
+    "Lesser Empower",
+
+    -- Heavy damage skills next
+    "Pommel Strike",
+    "Double Slash",
+    -- Default attack last
+    "Strike",
+}
+
+local function FindUsableSkill(combat)
+    local Scroll = combat.ActionBG.AttacksPage.Attack.ScrollingFrame
+
+    local function isUsable(skill)
+        if not skill or not skill:IsA("GuiObject") then return false end
+        if skill.Name == "UIListLayout" then return false end
+        local cd = skill:FindFirstChild("CD")
+        return cd and not IsFrameVisible(cd)
+    end
+
+    -- Priority list first
+    for _, name in ipairs(SkillPriority) do
+        local skill = Scroll:FindFirstChild(name)
+        if isUsable(skill) then return skill end
+    end
+
+    -- Fallback: any usable skill
+    for _, skill in Scroll:GetChildren() do
+        if isUsable(skill) then return skill end
+    end
+    return nil
+end
+
+local function FindFirstEnemy(combat)
+    local Scroll = combat.ActionBG.AttacksPage.Enemies.ScrollingFrame
+    for _, enemy in Scroll:GetChildren() do
+        if enemy:IsA("GuiObject")
+           and enemy.Name ~= "UIListLayout"
+           and enemy.Name ~= "EnemyTemplate"
+        then
+            return enemy
+        end
+    end
+    return nil
+end
+
+local function AutoSkill(combat)
+    local ActionBG     = combat:FindFirstChild("ActionBG")
+    if not ActionBG then return end
+    local ContextPage  = ActionBG:FindFirstChild("ContextPage")
+    local AttacksPage  = ActionBG:FindFirstChild("AttacksPage")
+    if not ContextPage or not AttacksPage then return end
+    local AttackButton = ContextPage:FindFirstChild("AttackButton")
+    local AttackScroll = AttacksPage.Attack and AttacksPage.Attack:FindFirstChild("ScrollingFrame")
+    if not AttackButton or not AttackScroll then return end
+
+    -- Step 1: open Attack page
+    for attempt = 1, 3 do
+        if not IsFrameVisible(ContextPage) then return end
+        ClickGui(AttackButton, "AttackButton #" .. attempt)
+        if WaitFor(function() return IsFrameVisible(AttackScroll) end, 1.5,
+                   "Attack scroll opens") then break end
+        if attempt == 3 then return end
+    end
+
+    task.wait(0.15)
+
+    -- Step 2: pick and click a skill
+    local chosen = FindUsableSkill(combat)
+    if not chosen then return end
+    print("[AutoSkill] Selected:", chosen.Name)
+
+    for attempt = 1, 3 do
+        ClickGui(chosen, "skill " .. chosen.Name .. " #" .. attempt)
+        local resolved = WaitFor(function()
+            return IsFrameVisible(AttacksPage.Enemies)
+                or not IsFrameVisible(AttackScroll)
+        end, 1.5, "skill click resolves")
+        if resolved then break end
+        if attempt == 3 then return end
+    end
+
+    -- Step 3: pick an enemy if list opened
+    if IsFrameVisible(AttacksPage.Enemies) and not IsFrameVisible(AttackScroll) then
+        task.wait(0.2)
+        local target = FindFirstEnemy(combat)
+        if not target then return end
+
+        for attempt = 1, 3 do
+            ClickGui(target, "enemy " .. target.Name .. " #" .. attempt)
+            if WaitFor(function()
+                return not IsFrameVisible(AttacksPage.Enemies)
+                    or IsFrameVisible(ContextPage)
+            end, 1.5, "enemy click resolves") then
+                print("[AutoSkill] Done.")
+                return
+            end
+        end
+    end
+end
+
+----------------------------------------------------- AutoSkill watcher
+
+local AutoRunning = false
+local LastActionVisible = false
+local FirstFire = true
+
+task.spawn(function()
+    while true do
+        if AutoSkillEnabled then
+            local pg = LocalPlayer:FindFirstChild("PlayerGui")
+            local combat = pg and pg:FindFirstChild("Combat")
+            local ActionBG = combat and combat:FindFirstChild("ActionBG")
+
+            if ActionBG then
+                local ContextPage = ActionBG:FindFirstChild("ContextPage")
+                local AttacksPage = ActionBG:FindFirstChild("AttacksPage")
+
+                local actionVisible = IsFrameVisible(ActionBG)
+                local atContextHome = ContextPage and IsFrameVisible(ContextPage)
+                                  and AttacksPage and not IsFrameVisible(AttacksPage)
+
+                if LastActionVisible and not actionVisible then
+                    FirstFire = true
+                end
+
+                local risingEdge = actionVisible and not LastActionVisible
+                local shouldFire = (risingEdge or FirstFire)
+                                and actionVisible and atContextHome
+                                and not AutoRunning
+                                and InCombat
+                if shouldFire then
+                    AutoRunning = true
+                    task.spawn(function()
+                        local settleTime = FirstFire and 1.0 or 0.4
+                        task.wait(settleTime)
+
+                        local pg2 = LocalPlayer:FindFirstChild("PlayerGui")
+                        local c2 = pg2 and pg2:FindFirstChild("Combat")
+                        local AB2 = c2 and c2:FindFirstChild("ActionBG")
+                        local CP2 = AB2 and AB2:FindFirstChild("ContextPage")
+                        if AB2 and CP2 and IsFrameVisible(AB2) and IsFrameVisible(CP2) then
+                            local ok, err = pcall(AutoSkill, c2)
+                            if not ok then warn("[AutoSkill] error: " .. tostring(err)) end
+                            FirstFire = false
+                        end
+                        task.wait(1.2)
+                        AutoRunning = false
+                    end)
+                end
+
+                LastActionVisible = actionVisible
+            else
+                LastActionVisible = false
+                FirstFire = true
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+----------------------------------------------------- In-combat detection
+
+local function GetCombatStatus()
+    local ok, result = pcall(function()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        if not pg then return false end
+        local hud = pg:FindFirstChild("HUD")
+        if not hud then return false end
+        local holder = hud:FindFirstChild("Holder")
+        if not holder then return false end
+        local cn = holder:FindFirstChild("CharacterName")
+        if not cn then return false end
+        local plrName = cn:FindFirstChild("PlrName")
+        if not plrName then return false end
+
+        local TextColor = GetTextColor(plrName)
+        local inCombatColor = Color3.new(1, 0.65, 0.65)
+        return ColorsMatch(TextColor, inCombatColor)
+    end)
+    return ok and result or false
+end
+
+local CombatThread = nil
+
+print("[ARCANE LINEAGE] Thread started")
+
+task.spawn(function()
+    while true do
+        local CurrentlyInCombat = GetCombatStatus()
+
+        if CurrentlyInCombat and not InCombat then
+            InCombat = true
+            send_notification("[ArcaneStuff] Combat Started", "info")
+            print("[ARCANE LINEAGE] In combat")
+
+            if not CombatThread then
+                CombatThread = task.spawn(CombatLoop)
+            end
+
+        elseif not CurrentlyInCombat and InCombat then
+            InCombat = false
+            send_notification("[ArcaneStuff] Out of Combat", "info")
+            print("[ARCANE LINEAGE] Out of combat")
+            if CombatThread then
+                task.cancel(CombatThread)
+                CombatThread = nil
+            end
+        end
+
+        task.wait(0.5)
+    end
+end)
