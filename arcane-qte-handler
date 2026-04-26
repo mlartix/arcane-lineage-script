@@ -19,7 +19,8 @@
 --]]
 
 ----------------------------------------------------- Offsets
-local AutoSkillEnabled = true  -- toggle to false to disable auto-skill
+local AutoSkillEnabled = _G.AutoSkillEnabled  -- toggle to false to disable auto-skill
+if AutoSkillEnabled == nil then AutoSkillEnabled = true end
 local InCombat = false
 local Offsets = crypt.json.decode(game:HttpGet("https://offsets.ntgetwritewatch.workers.dev/offsets.json"))
 -- Pinned to the version dump that matches your Roblox build. The generic
